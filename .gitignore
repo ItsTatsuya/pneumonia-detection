@@ -1,5 +1,6 @@
 test/
 __pycache__/
 checkpoints/
-chest_xray/
+dataset/
 models/
+output/

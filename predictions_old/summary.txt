@@ -1,0 +1,20 @@
+Model: efficientnet_b4
+Test dataset: ./chest_xray/test
+Total images: 624
+Normal images: 234
+Pneumonia images: 390
+
+Overall Accuracy: 92.95%
+Normal Class Accuracy: 91.03%
+Pneumonia Class Accuracy: 94.10%
+ROC AUC: 0.9783
+
+Classification Report:
+              precision    recall  f1-score   support
+
+      Normal       0.90      0.91      0.91       234
+   Pneumonia       0.95      0.94      0.94       390
+
+    accuracy                           0.93       624
+   macro avg       0.92      0.93      0.92       624
+weighted avg       0.93      0.93      0.93       624

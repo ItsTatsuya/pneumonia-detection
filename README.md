@@ -4,7 +4,7 @@ This project implements a deep learning model to detect pneumonia from chest X-r
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.9+
 - CUDA-compatible GPU (for GPU acceleration)
 - Dependencies listed in `requirements.txt`
 
@@ -56,6 +56,7 @@ Additional training options:
 - `--lr`: Learning rate (default: 0.001)
 - `--num_workers`: Number of data loading workers (default: 4)
 - `--pretrained`: Use pretrained weights (default: True)
+- `--no_pretrained`: Disable pretrained weights
 - `--model_type`: Model architecture to use (default: 'efficientnet_b4')
 
 #### Checkpoint Options

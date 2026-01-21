@@ -1,38 +1,29 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import Dataset, WeightedRandomSampler
 from torchvision import models
 from torchvision.models import ResNet50_Weights, EfficientNet_B3_Weights, EfficientNet_B4_Weights
-from torch.amp import autocast, GradScaler  # Updated import for mixed precision training
+from torch.amp import autocast, GradScaler
 import os
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+from sklearn.metrics import classification_report, roc_curve, auc
 from tqdm import tqdm
 import random
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
-import timm  # Add timm for advanced models
-import albumentations as A  # Add albumentations for advanced augmentations
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+import timm
+import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-# Check if GPU is available
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
 
-# Define enhanced model architecture with more options
 class PneumoniaModel(nn.Module):
     def __init__(self, use_pretrained=True, model_type='efficientnet_b4'):
         super(PneumoniaModel, self).__init__()
 
-        # Modify all models to use BCEWithLogitsLoss instead of BCELoss
-        # This means removing the sigmoid from the model outputs
-
         if model_type == 'resnet':
-            # Original ResNet50 model
             weights = ResNet50_Weights.IMAGENET1K_V1 if use_pretrained else None
             self.model = models.resnet50(weights=weights)
             in_features = self.model.fc.in_features
@@ -41,10 +32,8 @@ class PneumoniaModel(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.3),
                 nn.Linear(512, 1)
-                # Removed Sigmoid for compatibility with BCEWithLogitsLoss
             )
         elif model_type == 'efficientnet':
-            # EfficientNet-B3 model
             weights = EfficientNet_B3_Weights.IMAGENET1K_V1 if use_pretrained else None
             self.model = models.efficientnet_b3(weights=weights)
             in_features = self.model.classifier[1].in_features
@@ -54,31 +43,25 @@ class PneumoniaModel(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.5),
                 nn.Linear(512, 1)
-                # Removed Sigmoid for compatibility with BCEWithLogitsLoss
             )
         elif model_type == 'efficientnet_b4':
-            # EfficientNet-B4 model - higher capacity than B3
             weights = EfficientNet_B4_Weights.IMAGENET1K_V1 if use_pretrained else None
             self.model = models.efficientnet_b4(weights=weights)
             in_features = self.model.classifier[1].in_features
             self.model.classifier = nn.Sequential(
                 nn.Dropout(0.4),
-                nn.Linear(in_features, 1024),  # Wider layers
+                nn.Linear(in_features, 1024),
                 nn.ReLU(),
                 nn.Dropout(0.5),
                 nn.Linear(1024, 512),
                 nn.ReLU(),
                 nn.Dropout(0.3),
                 nn.Linear(512, 1)
-                # Removed Sigmoid for compatibility with BCEWithLogitsLoss
             )
         elif model_type == 'ensemble':
-            # Create an ensemble of models
-            # This is just a placeholder - uncomment and implement if you want to use it
             raise NotImplementedError("Ensemble model not implemented yet")
 
         elif 'timm_' in model_type:
-            # Use a model from timm (e.g., 'timm_tf_efficientnetv2_s')
             model_name = model_type.replace('timm_', '')
             self.model = timm.create_model(model_name, pretrained=use_pretrained, num_classes=0)
             in_features = self.model.num_features
@@ -88,25 +71,19 @@ class PneumoniaModel(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.3),
                 nn.Linear(1024, 1)
-                # Removed Sigmoid for compatibility with BCEWithLogitsLoss
             )
 
     def forward(self, x):
         if hasattr(self, 'classifier'):
-            # For timm models
             features = self.model(x)
             return self.classifier(features)
-        else:
-            # For torchvision models
-            return self.model(x)
+        return self.model(x)
 
-# Enhanced dataset class with class balancing capabilities
 class ChestXRayDataset(Dataset):
     def __init__(self, image_dir, transform=None):
         self.image_dir = image_dir
         self.transform = transform
 
-        # Get all image files
         self.normal_images = [os.path.join(image_dir, 'NORMAL', img)
                              for img in os.listdir(os.path.join(image_dir, 'NORMAL'))]
         self.pneumonia_images = [os.path.join(image_dir, 'PNEUMONIA', img)
@@ -136,21 +113,19 @@ class ChestXRayDataset(Dataset):
             'pneumonia': len(self.pneumonia_images)
         }
 
-# Improved data preprocessing with Albumentations - fix warnings
 def get_transforms():
-    # Using Albumentations for more advanced augmentations
     train_transform = A.Compose([
         A.Resize(height=256, width=256),
         A.RandomCrop(height=224, width=224),
         A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.2),  # X-rays can sometimes be flipped vertically
-        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=15, p=0.5),  # Will generate warning but works
+        A.VerticalFlip(p=0.2),
+        A.Affine(translate_percent=0.1, scale=(0.8, 1.2), rotate=(-15, 15), p=0.5),
         A.OneOf([
             A.GridDistortion(p=1.0),
             A.ElasticTransform(p=1.0)
         ], p=0.3),
         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-        A.GaussNoise(p=0.2),  # Fixed: removed var_limit parameter
+        A.GaussNoise(p=0.2),
         A.GaussianBlur(blur_limit=(3, 7), p=0.2),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
@@ -164,7 +139,6 @@ def get_transforms():
 
     return train_transform, val_transform
 
-# Set random seed for reproducibility
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -175,17 +149,17 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# Enhanced training function with mixed precision training
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=15,
-                checkpoint_dir='checkpoints', resume_from=None, save_freq=1):
+                checkpoint_dir='checkpoints', resume_from=None, save_freq=1,
+                early_stop_patience=10, early_stop_min_delta=0.001):
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
     best_val_acc = 0.0
+    epochs_without_improve = 0
     start_epoch = 0
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
 
-    # Resume from checkpoint if specified
     if resume_from and os.path.isfile(resume_from):
         print(f"Loading checkpoint '{resume_from}'")
         checkpoint = torch.load(resume_from)
@@ -198,22 +172,18 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     else:
         print("No checkpoint found, starting from scratch")
 
-    # Add mixed precision training - fix the deprecated warning
     scaler = GradScaler()
 
-    # Use cosine annealing scheduler with warm restarts
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=1, eta_min=1e-6)
 
     for epoch in range(start_epoch, num_epochs):
         print(f'Epoch {epoch+1}/{num_epochs}:')
 
-        # Training phase
         model.train()
         running_loss = 0.0
         correct = 0
         total = 0
 
-        # Add progress bar for training
         train_pbar = tqdm(train_loader, desc="Training")
 
         for inputs, labels in train_pbar:
@@ -221,23 +191,19 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 
             optimizer.zero_grad()
 
-            # Use mixed precision training - add the required device_type parameter
             with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
                 outputs = model(inputs).squeeze()
                 loss = criterion(outputs, labels)
 
-            # Scale gradients and optimize
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             running_loss += loss.item() * inputs.size(0)
-            # For metrics we need to apply sigmoid since we're using BCEWithLogitsLoss
             predicted = (torch.sigmoid(outputs) > 0.5).float()
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
-            # Update progress bar description with current loss
             train_pbar.set_postfix(loss=loss.item(), acc=(predicted == labels).float().mean().item())
 
         epoch_loss = running_loss / len(train_loader.dataset)
@@ -245,13 +211,11 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         history['train_loss'].append(epoch_loss)
         history['train_acc'].append(epoch_acc)
 
-        # Validation phase
         model.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
 
-        # Add progress bar for validation
         val_pbar = tqdm(val_loader, desc="Validation", leave=False)
 
         with torch.no_grad():
@@ -262,12 +226,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 loss = criterion(outputs, labels)
 
                 val_loss += loss.item() * inputs.size(0)
-                # For metrics we need to apply sigmoid since we're using BCEWithLogitsLoss
                 predicted = (torch.sigmoid(outputs) > 0.5).float()
                 val_total += labels.size(0)
                 val_correct += (predicted == labels).sum().item()
 
-                # Update progress bar description with current validation loss
                 val_pbar.set_postfix(loss=loss.item(), acc=(predicted == labels).float().mean().item())
 
         val_epoch_loss = val_loss / len(val_loader.dataset)
@@ -278,16 +240,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         print(f'Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.4f}')
         print(f'Val Loss: {val_epoch_loss:.4f}, Val Acc: {val_epoch_acc:.4f}')
 
-        # Use cosine scheduler
         scheduler.step()
 
-        # Log current learning rate
         current_lr = optimizer.param_groups[0]['lr']
         print(f'Current Learning Rate: {current_lr:.6f}')
 
-        # Save the best model
-        if val_epoch_acc > best_val_acc:
+        if val_epoch_acc > best_val_acc + early_stop_min_delta:
             best_val_acc = val_epoch_acc
+            epochs_without_improve = 0
             best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
             torch.save({
                 'epoch': epoch + 1,
@@ -297,8 +257,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 'history': history
             }, best_model_path)
             print(f"Saved best model to {best_model_path} with validation accuracy: {best_val_acc:.4f}")
+        else:
+            epochs_without_improve += 1
 
-        # Save regular checkpoint based on save frequency
         if (epoch + 1) % save_freq == 0:
             checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
             torch.save({
@@ -310,7 +271,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             }, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
 
-    # Load the best model at the end of training
+        if early_stop_patience > 0 and epochs_without_improve >= early_stop_patience:
+            print(f"Early stopping triggered after {epoch + 1} epochs with no improvement.")
+            break
+
     best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
     if os.path.isfile(best_model_path):
         checkpoint = torch.load(best_model_path)
@@ -319,7 +283,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 
     return model, history
 
-# Evaluation function - update for BCEWithLogitsLoss
 def evaluate_model(model, test_loader):
     model.eval()
     all_preds = []
@@ -327,7 +290,6 @@ def evaluate_model(model, test_loader):
     test_correct = 0
     test_total = 0
 
-    # Add progress bar for testing
     test_pbar = tqdm(test_loader, desc="Testing")
 
     with torch.no_grad():
@@ -335,14 +297,12 @@ def evaluate_model(model, test_loader):
             inputs, labels = inputs.to(device), labels.to(device)
 
             outputs = model(inputs).squeeze()
-            # Apply sigmoid for probabilities since we're using BCEWithLogitsLoss
             probs = torch.sigmoid(outputs)
             predicted = (probs > 0.5).float()
 
             test_total += labels.size(0)
             test_correct += (predicted == labels).sum().item()
 
-            # Update progress bar with current accuracy
             current_acc = (predicted == labels).float().mean().item()
             test_pbar.set_postfix(acc=current_acc)
 
@@ -352,18 +312,15 @@ def evaluate_model(model, test_loader):
     test_acc = test_correct / test_total
     print(f'Test Accuracy: {test_acc:.4f}')
 
-    # Calculate ROC curve and AUC
     fpr, tpr, _ = roc_curve(all_labels, all_preds)
     roc_auc = auc(fpr, tpr)
 
-    # Create classification report
     binary_preds = [1 if p > 0.5 else 0 for p in all_preds]
     report = classification_report(all_labels, binary_preds, target_names=['Normal', 'Pneumonia'])
 
     print(report)
     print(f'AUC: {roc_auc:.4f}')
 
-    # Plot ROC curve
     plt.figure()
     plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
     plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
@@ -377,7 +334,6 @@ def evaluate_model(model, test_loader):
 
     return test_acc, all_preds, all_labels
 
-# Function to make predictions on a single image - update for BCEWithLogitsLoss
 def predict_image(model, image_path, transform):
     model.eval()
     image = Image.open(image_path).convert('RGB')
@@ -385,19 +341,15 @@ def predict_image(model, image_path, transform):
 
     with torch.no_grad():
         output = model(image).squeeze().item()
-        # Apply sigmoid since we're using BCEWithLogitsLoss
         probability = torch.sigmoid(torch.tensor(output)).item()
 
     prediction = "Pneumonia" if probability > 0.5 else "Normal"
 
     return prediction, probability
 
-# Main function to run the model
 def main():
-    # Set random seed for reproducibility
     set_seed(42)
 
-    # Set paths
     data_dir = './chest_xray'  # Update this to your dataset path
     train_dir = os.path.join(data_dir, 'train')
     val_dir = os.path.join(data_dir, 'val')
