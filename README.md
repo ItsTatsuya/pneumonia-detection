@@ -1,33 +1,52 @@
-# Pneumonia Detection from Chest X-rays with GPU Acceleration
+# Pneumonia Detection from Chest X-rays
 
-This project implements a deep learning model to detect pneumonia from chest X-ray images with GPU acceleration.
+Deep learning model for detecting pneumonia in chest X-ray images. Uses ConvNeXt V2 with various training tricks to achieve ~95% accuracy.
+
+## Results
+
+**Test Set Performance (624 images):**
+
+| Metric          | Score  |
+| --------------- | ------ |
+| Accuracy        | 94.87% |
+| ROC AUC         | 0.9787 |
+| Sensitivity     | 96.41% |
+| Specificity     | 92.31% |
+| False Positives | 18     |
+| False Negatives | 14     |
+
+```
+              precision    recall  f1-score   support
+
+      Normal       0.94      0.92      0.93       234
+   Pneumonia       0.95      0.96      0.96       390
+
+    accuracy                           0.95       624
+```
 
 ## Requirements
 
 - Python 3.9+
-- CUDA-compatible GPU (for GPU acceleration)
-- Dependencies listed in `requirements.txt`
+- CUDA GPU (training takes ~30 min on RTX 3080)
+- ~4GB VRAM minimum
 
-## Installation
+## Quick Start
 
-1. Clone this repository:
+```bash
+# Install deps
+pip install -r requirements.txt
 
-   ```
-   git clone https://github.com/yourusername/pneumonia-detection.git
-   cd pneumonia-detection
-   ```
+# Train
+python train.py --data_dir ./dataset --epochs 40
 
-2. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
+# Predict
+python predict.py --model_path output/pneumonia_model_TIMESTAMP.pth --data_dir dataset/test --use_tta
+```
 
-## Dataset
-
-The model is designed to work with the Chest X-Ray dataset that contains normal and pneumonia X-ray images. The expected dataset structure is:
+## Dataset Structure
 
 ```
-chest_xray/
+dataset/
 ├── train/
 │   ├── NORMAL/
 │   └── PNEUMONIA/
@@ -39,162 +58,82 @@ chest_xray/
     └── PNEUMONIA/
 ```
 
-You can download the dataset from [Kaggle](https://www.kaggle.com/paultimothymooney/chest-xray-pneumonia).
+Get it from [Kaggle](https://www.kaggle.com/paultimothymooney/chest-xray-pneumonia).
 
-## Usage
+## Training
 
-### Training
-
-To train the model:
-
-```
-python train.py --data_dir /path/to/chest_xray --batch_size 32 --epochs 25 --output_dir models
+```bash
+python train.py --data_dir /path/to/data --batch_size 16 --epochs 40
 ```
 
-Additional training options:
+**Key arguments:**
 
-- `--lr`: Learning rate (default: 0.001)
-- `--num_workers`: Number of data loading workers (default: 4)
-- `--pretrained`: Use pretrained weights (default: True)
-- `--no_pretrained`: Disable pretrained weights
-- `--model_type`: Model architecture to use (default: 'efficientnet_b4')
+- `--loss_type`: `combined` (focal + label smoothing), `focal`, `smooth_bce`, `bce`
+- `--use_mixup` / `--no_mixup`: Mixup augmentation (on by default)
+- `--use_swa` / `--no_swa`: Stochastic Weight Averaging (on by default)
+- `--resume_from`: Resume from checkpoint
 
-#### Checkpoint Options
+**Resume training:**
 
-The training script supports checkpointing to save training progress and resume from interruptions:
-
-- `--checkpoint_dir`: Directory to save checkpoints (default: 'checkpoints')
-- `--resume_from`: Path to a checkpoint to resume training from
-- `--save_freq`: Save checkpoint every N epochs (default: 1)
-- `--keep_checkpoints`: Number of most recent checkpoints to keep (default: 3)
-
-To resume training from a checkpoint:
-
-```
-python train.py --data_dir /path/to/chest_xray --resume_from checkpoints/checkpoint_epoch_10.pth
+```bash
+python train.py --data_dir ./dataset --resume_from checkpoints/checkpoint_epoch_10.pth
 ```
 
-### Prediction
+## Prediction
 
-To make predictions on new X-ray images:
-
-```
-python predict.py --model_path models/pneumonia_model.pth --image_path /path/to/xray.jpg
+```bash
+python predict.py --model_path output/model.pth --data_dir dataset/test
 ```
 
-For batch predictions on a directory of images:
+**Key arguments:**
 
-```
-python predict.py --model_path models/pneumonia_model.pth --image_path /path/to/images_dir
-```
+- `--use_tta` / `--no_tta`: Test-time augmentation (averages 5 augmented predictions)
+- `--optimize_threshold`: Finds best classification threshold (not just 0.5)
+- `--threshold 0.7`: Use specific threshold
 
-## Model Architecture
+## What's Under the Hood
 
-The project implements several advanced model architectures with the following options:
+**Model:** ConvNeXt V2 Base pretrained on ImageNet-22k.
 
-### EfficientNet-B4 (Default)
+**Loss:** Combined focal loss + label smoothing BCE. Focal loss helps with the class imbalance, label smoothing prevents overconfident predictions.
 
-Our default model uses EfficientNet-B4 architecture which offers an excellent balance between accuracy and computational efficiency. The model has been enhanced with:
+**Augmentation:** Heavy augmentation via Albumentations - elastic transforms, grid distortion, coarse dropout, brightness/contrast jitter, etc. Also uses mixup during training.
 
-- Custom classifier head with 1024 neurons in the first fully connected layer
-- Multiple dropout layers (0.4, 0.5, 0.3) to prevent overfitting
-- Multi-layer structure for better feature extraction
+**Training tricks:**
 
-### Other Available Architectures
+- Mixed precision (AMP) for faster training
+- OneCycleLR scheduler
+- Stochastic Weight Averaging in final epochs
+- Gradient clipping
+- AdamW with weight decay
 
-- `resnet`: ResNet-50 architecture with custom classifier
-- `efficientnet`: EfficientNet-B3 with custom classifier
-- `efficientnet_b4`: EfficientNet-B4 with enhanced classifier (default)
-- `timm_*`: Any model from the timm library (e.g., `timm_tf_efficientnetv2_s`)
+**Inference tricks:**
 
-## Advanced Features
+- Test-time augmentation (5 augmented versions averaged)
+- Threshold optimization (finds optimal cutoff, not just 0.5)
 
-### Mixed Precision Training
+## Checkpoints
 
-The model uses mixed precision training with automatic mixed precision (AMP) to:
+Training saves:
 
-- Speed up training by approximately 2-3x
-- Reduce memory usage
-- Maintain numerical stability and accuracy
+- `checkpoints/best_model.pth` - Best validation accuracy
+- `checkpoints/swa_model.pth` - SWA averaged weights
+- `checkpoints/checkpoint_epoch_N.pth` - Periodic saves
 
-### Enhanced Data Augmentation
+Output saves:
 
-We use Albumentations library for advanced augmentations:
+- `output/pneumonia_model_TIMESTAMP.pth` - Full checkpoint
+- `output/pneumonia_model_TIMESTAMP_weights_only.pth` - Just weights (smaller)
+- `output/pneumonia_model_TIMESTAMP_swa.pth` - SWA model
 
-- Elastic transforms and grid distortion specifically effective for medical imaging
-- Vertical flipping (useful for some X-ray datasets)
-- Gaussian noise and blur for improved robustness
-- Random brightness and contrast adjustments
-- Extensive geometric transformations (rotation, scaling, translation)
+## Prediction Output
 
-### Learning Rate Scheduling
+Running predict.py generates in `predictions/`:
 
-The model implements CosineAnnealingWarmRestarts scheduler which:
-
-- Periodically reduces learning rate following a cosine curve
-- Periodically "restarts" the learning rate to help escape local minima
-- Improves convergence compared to step-based schedulers
-
-### Class Balancing
-
-For imbalanced datasets, the model automatically:
-
-- Detects class imbalance in the training data
-- Implements weighted sampling to ensure equal representation
-- Applies class weights to the loss function
-
-### Random Seed Control
-
-Full control over random seed initialization for reproducibility.
-
-## Performance
-
-The enhanced model achieves:
-
-- Test Accuracy: >93% on the pneumonia detection task
-- AUC (Area Under ROC Curve): >0.97
-- High recall for pneumonia class (~97%) which is critical for medical applications
-
-### Comparison with Original Model
-
-| Metric            | Original Model    | Enhanced Model              |
-| ----------------- | ----------------- | --------------------------- |
-| Architecture      | ResNet-50         | EfficientNet-B4             |
-| Data Augmentation | Basic             | Advanced (Albumentations)   |
-| Training Method   | Standard          | Mixed Precision             |
-| Scheduler         | ReduceLROnPlateau | CosineAnnealingWarmRestarts |
-| Test Accuracy     | ~90%              | >93%                        |
-| AUC               | ~0.95             | >0.97                       |
-| Training Time     | Baseline          | ~40% faster                 |
-
-## GPU Acceleration
-
-The code automatically uses GPU acceleration if available. To verify GPU usage, check the output when running the scripts:
-
-```
-Using device: cuda
-```
-
-The implementation includes:
-
-- Automatic detection of CUDA-capable GPUs
-- Mixed precision training with torch.cuda.amp
-- Efficient data loading with pin_memory and non-blocking transfers
-
-## Checkpoint System
-
-The model implements a robust checkpoint system that:
-
-1. Saves the best model based on validation accuracy
-2. Periodically saves checkpoints during training
-3. Allows resuming training from any checkpoint
-4. Automatically cleans up old checkpoints to save disk space
-
-Two versions of the final model are saved:
-
-- A complete checkpoint with training state (for resuming training)
-- A lightweight version with only model weights (for deployment/inference)
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+- `predictions.csv` - All predictions with probabilities
+- `summary.txt` - Accuracy metrics
+- `classification_report.txt` - Precision/recall/F1
+- `confusion_matrix.png`
+- `roc_curve.png`
+- `precision_recall_curve.png`
+- `threshold_analysis.png` - How metrics change with threshold

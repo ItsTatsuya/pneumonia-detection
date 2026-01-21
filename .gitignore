@@ -4,3 +4,5 @@ checkpoints/
 dataset/
 models/
 output/
+.agents/
+.opencode/

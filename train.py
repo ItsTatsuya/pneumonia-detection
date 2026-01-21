@@ -1,7 +1,8 @@
 import argparse
 import os
 import torch
-from model import PneumoniaModel, ChestXRayDataset, get_transforms, train_model, evaluate_model
+from model import (PneumoniaModel, ChestXRayDataset, get_transforms, train_model,
+                   evaluate_model, CombinedLoss, FocalLoss, LabelSmoothingBCEWithLogitsLoss)
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.nn as nn
 import torch.optim as optim
@@ -11,20 +12,28 @@ import shutil
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a pneumonia detection model')
     parser.add_argument('--data_dir', type=str, required=True, help='Path to the dataset directory')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
-    parser.add_argument('--epochs', type=int, default=60, help='Number of epochs to train')
-    parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=40, help='Number of epochs to train')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for data loading')
     parser.add_argument('--pretrained', action='store_true', default=True, help='Use pretrained model (default: True)')
     parser.add_argument('--no_pretrained', dest='pretrained', action='store_false', help='Disable pretrained weights')
-    parser.add_argument('--model_type', type=str, default='efficientnet_b4', help='Model architecture to use')
     parser.add_argument('--output_dir', type=str, default='output', help='Output directory for saving models')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help='Directory for saving checkpoints')
     parser.add_argument('--resume_from', type=str, default=None, help='Path to checkpoint to resume training from')
     parser.add_argument('--save_freq', type=int, default=1, help='Save checkpoint every N epochs')
     parser.add_argument('--keep_checkpoints', type=int, default=3, help='Number of most recent checkpoints to keep')
-    parser.add_argument('--early_stop_patience', type=int, default=10, help='Early stopping patience in epochs')
+    parser.add_argument('--early_stop_patience', type=int, default=15, help='Early stopping patience in epochs')
     parser.add_argument('--early_stop_min_delta', type=float, default=0.001, help='Minimum improvement to reset patience')
+    parser.add_argument('--loss_type', type=str, default='combined',
+                        help='Loss function: combined, focal, smooth_bce, bce')
+    parser.add_argument('--use_mixup', action='store_true', default=True, help='Use mixup augmentation')
+    parser.add_argument('--no_mixup', dest='use_mixup', action='store_false', help='Disable mixup augmentation')
+    parser.add_argument('--use_swa', action='store_true', default=True, help='Use Stochastic Weight Averaging')
+    parser.add_argument('--no_swa', dest='use_swa', action='store_false', help='Disable SWA')
+    parser.add_argument('--swa_start', type=int, default=25, help='Epoch to start SWA')
+    parser.add_argument('--image_size', type=int, default=256, help='Input image size before crop')
+    parser.add_argument('--crop_size', type=int, default=224, help='Crop size for training')
     return parser.parse_args()
 
 def cleanup_old_checkpoints(checkpoint_dir, keep_n, exclude=None):
@@ -60,7 +69,7 @@ def main():
     val_dir = os.path.join(args.data_dir, 'val')
     test_dir = os.path.join(args.data_dir, 'test')
 
-    train_transform, val_transform = get_transforms()
+    train_transform, val_transform = get_transforms(args.image_size, args.crop_size)
 
     print("Creating datasets...")
     train_dataset = ChestXRayDataset(train_dir, transform=train_transform)
@@ -109,19 +118,33 @@ def main():
     )
 
     print("Initializing model...")
-    model = PneumoniaModel(use_pretrained=args.pretrained, model_type=args.model_type).to(device)
+    model = PneumoniaModel(use_pretrained=args.pretrained).to(device)
 
-    if sampler is not None:
-        pos_weight = torch.tensor([class_counts['normal'] / max(1, class_counts['pneumonia'])], device=device)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # Select loss function based on argument
+    if args.loss_type == 'combined':
+        criterion = CombinedLoss(focal_weight=0.5, smoothing=0.05, alpha=0.25, gamma=2.0)
+        print("Using Combined Loss (Focal + Label Smoothing BCE)")
+    elif args.loss_type == 'focal':
+        criterion = FocalLoss(alpha=0.25, gamma=2.0)
+        print("Using Focal Loss")
+    elif args.loss_type == 'smooth_bce':
+        criterion = LabelSmoothingBCEWithLogitsLoss(smoothing=0.1)
+        print("Using Label Smoothing BCE Loss")
     else:
-        criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        if sampler is not None:
+            pos_weight = torch.tensor([class_counts['normal'] / max(1, class_counts['pneumonia'])], device=device)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        else:
+            criterion = nn.BCEWithLogitsLoss()
+        print("Using BCE with Logits Loss")
+
+    # Use AdamW with weight decay for better generalization
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("Starting training...")
-    model, history = train_model(
+    model, history, swa_model = train_model(
         model,
         train_loader,
         val_loader,
@@ -132,7 +155,10 @@ def main():
         resume_from=args.resume_from,
         save_freq=args.save_freq,
         early_stop_patience=args.early_stop_patience,
-        early_stop_min_delta=args.early_stop_min_delta
+        early_stop_min_delta=args.early_stop_min_delta,
+        use_mixup=args.use_mixup,
+        use_swa=args.use_swa,
+        swa_start=args.swa_start
     )
 
     cleanup_old_checkpoints(args.checkpoint_dir, args.keep_checkpoints)
@@ -158,18 +184,30 @@ def main():
             f"{os.path.join(args.output_dir, f'pneumonia_model_{timestamp}_weights_only.pth')}"
         )
 
+    # Also save SWA model if available
+    swa_model_path = os.path.join(args.checkpoint_dir, 'swa_model.pth')
+    if os.path.exists(swa_model_path):
+        shutil.copy2(swa_model_path, os.path.join(args.output_dir, f"pneumonia_model_{timestamp}_swa.pth"))
+        print(f"SWA model saved to {os.path.join(args.output_dir, f'pneumonia_model_{timestamp}_swa.pth')}")
+
     print("Evaluating model on test set...")
     test_acc, all_preds, all_labels = evaluate_model(model, test_loader)
 
     print(f"Training complete! Final test accuracy: {test_acc:.4f}")
 
     with open(os.path.join(args.output_dir, f"training_summary_{timestamp}.txt"), "w") as f:
-        f.write(f"Model: {args.model_type}\n")
+        f.write(f"Model: ConvNeXt V2 Base\n")
         f.write(f"Timestamp: {timestamp}\n")
         f.write(f"Epochs: {args.epochs}\n")
         f.write(f"Batch size: {args.batch_size}\n")
         f.write(f"Learning rate: {args.lr}\n")
         f.write(f"Pretrained: {args.pretrained}\n")
+        f.write(f"Loss type: {args.loss_type}\n")
+        f.write(f"Use mixup: {args.use_mixup}\n")
+        f.write(f"Use SWA: {args.use_swa}\n")
+        f.write(f"SWA start epoch: {args.swa_start}\n")
+        f.write(f"Image size: {args.image_size}\n")
+        f.write(f"Crop size: {args.crop_size}\n")
         f.write(f"Final test accuracy: {test_acc:.4f}\n")
         if checkpoint:
             f.write(f"Best validation accuracy: {checkpoint['best_val_acc']:.4f}\n")

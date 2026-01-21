@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, WeightedRandomSampler
-from torchvision import models
-from torchvision.models import ResNet50_Weights, EfficientNet_B3_Weights, EfficientNet_B4_Weights
 from torch.amp import autocast, GradScaler
+from torch.optim.swa_utils import AveragedModel, SWALR
 import os
 import numpy as np
 from PIL import Image
@@ -12,72 +12,78 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, roc_curve, auc
 from tqdm import tqdm
 import random
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import OneCycleLR
 import timm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+
+class FocalLoss(nn.Module):
+    """Focal Loss for handling class imbalance - focuses on hard examples"""
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        F_loss = alpha_t * (1 - pt) ** self.gamma * BCE_loss
+
+        if self.reduction == 'mean':
+            return F_loss.mean()
+        elif self.reduction == 'sum':
+            return F_loss.sum()
+        return F_loss
+
+
+class LabelSmoothingBCEWithLogitsLoss(nn.Module):
+    """BCE with label smoothing to prevent overconfident predictions"""
+    def __init__(self, smoothing=0.1):
+        super(LabelSmoothingBCEWithLogitsLoss, self).__init__()
+        self.smoothing = smoothing
+
+    def forward(self, inputs, targets):
+        targets = targets * (1 - self.smoothing) + 0.5 * self.smoothing
+        return F.binary_cross_entropy_with_logits(inputs, targets)
+
+
+class CombinedLoss(nn.Module):
+    """Combines Focal Loss and Label Smoothing BCE for robust training"""
+    def __init__(self, focal_weight=0.5, smoothing=0.05, alpha=0.25, gamma=2.0):
+        super(CombinedLoss, self).__init__()
+        self.focal_loss = FocalLoss(alpha=alpha, gamma=gamma)
+        self.smooth_bce = LabelSmoothingBCEWithLogitsLoss(smoothing=smoothing)
+        self.focal_weight = focal_weight
+
+    def forward(self, inputs, targets):
+        return self.focal_weight * self.focal_loss(inputs, targets) + \
+               (1 - self.focal_weight) * self.smooth_bce(inputs, targets)
+
 class PneumoniaModel(nn.Module):
-    def __init__(self, use_pretrained=True, model_type='efficientnet_b4'):
+    def __init__(self, use_pretrained=True):
         super(PneumoniaModel, self).__init__()
 
-        if model_type == 'resnet':
-            weights = ResNet50_Weights.IMAGENET1K_V1 if use_pretrained else None
-            self.model = models.resnet50(weights=weights)
-            in_features = self.model.fc.in_features
-            self.model.fc = nn.Sequential(
-                nn.Linear(in_features, 512),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(512, 1)
-            )
-        elif model_type == 'efficientnet':
-            weights = EfficientNet_B3_Weights.IMAGENET1K_V1 if use_pretrained else None
-            self.model = models.efficientnet_b3(weights=weights)
-            in_features = self.model.classifier[1].in_features
-            self.model.classifier = nn.Sequential(
-                nn.Dropout(0.4),
-                nn.Linear(in_features, 512),
-                nn.ReLU(),
-                nn.Dropout(0.5),
-                nn.Linear(512, 1)
-            )
-        elif model_type == 'efficientnet_b4':
-            weights = EfficientNet_B4_Weights.IMAGENET1K_V1 if use_pretrained else None
-            self.model = models.efficientnet_b4(weights=weights)
-            in_features = self.model.classifier[1].in_features
-            self.model.classifier = nn.Sequential(
-                nn.Dropout(0.4),
-                nn.Linear(in_features, 1024),
-                nn.ReLU(),
-                nn.Dropout(0.5),
-                nn.Linear(1024, 512),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(512, 1)
-            )
-        elif model_type == 'ensemble':
-            raise NotImplementedError("Ensemble model not implemented yet")
-
-        elif 'timm_' in model_type:
-            model_name = model_type.replace('timm_', '')
-            self.model = timm.create_model(model_name, pretrained=use_pretrained, num_classes=0)
-            in_features = self.model.num_features
-            self.classifier = nn.Sequential(
-                nn.Dropout(0.5),
-                nn.Linear(in_features, 1024),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(1024, 1)
-            )
+        # ConvNeXt V2 Base pretrained on ImageNet-22k
+        self.model = timm.create_model('convnextv2_base.fcmae_ft_in22k_in1k',
+                                       pretrained=use_pretrained, num_classes=0)
+        in_features = self.model.num_features
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(in_features),
+            nn.Dropout(0.4),
+            nn.Linear(in_features, 512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 1)
+        )
 
     def forward(self, x):
-        if hasattr(self, 'classifier'):
-            features = self.model(x)
-            return self.classifier(features)
-        return self.model(x)
+        features = self.model(x)
+        return self.classifier(features)
 
 class ChestXRayDataset(Dataset):
     def __init__(self, image_dir, transform=None):
@@ -113,31 +119,82 @@ class ChestXRayDataset(Dataset):
             'pneumonia': len(self.pneumonia_images)
         }
 
-def get_transforms():
+def get_transforms(image_size=256, crop_size=224):
+    """Enhanced transforms with stronger augmentation for better generalization"""
     train_transform = A.Compose([
-        A.Resize(height=256, width=256),
-        A.RandomCrop(height=224, width=224),
+        A.Resize(height=image_size, width=image_size),
+        A.RandomCrop(height=crop_size, width=crop_size),
         A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.2),
-        A.Affine(translate_percent=0.1, scale=(0.8, 1.2), rotate=(-15, 15), p=0.5),
+        A.VerticalFlip(p=0.1),
+        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=15, p=0.5),
         A.OneOf([
-            A.GridDistortion(p=1.0),
-            A.ElasticTransform(p=1.0)
+            A.GridDistortion(num_steps=5, distort_limit=0.3, p=1.0),
+            A.ElasticTransform(alpha=1, sigma=50, p=1.0),
+            A.OpticalDistortion(distort_limit=0.3, shift_limit=0.3, p=1.0),
         ], p=0.3),
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-        A.GaussNoise(p=0.2),
-        A.GaussianBlur(blur_limit=(3, 7), p=0.2),
+        A.OneOf([
+            A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+            A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+            A.MotionBlur(blur_limit=7, p=1.0),
+        ], p=0.2),
+        A.OneOf([
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
+            A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=1.0),
+            A.RandomGamma(gamma_limit=(80, 120), p=1.0),
+        ], p=0.5),
+        A.CoarseDropout(max_holes=8, max_height=crop_size//16, max_width=crop_size//16,
+                       min_holes=1, min_height=crop_size//32, min_width=crop_size//32, p=0.3),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
 
     val_transform = A.Compose([
-        A.Resize(height=224, width=224),
+        A.Resize(height=crop_size, width=crop_size),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
 
     return train_transform, val_transform
+
+
+def get_tta_transforms(crop_size=224):
+    """Test-time augmentation transforms for more robust predictions"""
+    return [
+        # Original
+        A.Compose([
+            A.Resize(height=crop_size, width=crop_size),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ]),
+        # Horizontal flip
+        A.Compose([
+            A.Resize(height=crop_size, width=crop_size),
+            A.HorizontalFlip(p=1.0),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ]),
+        # Slight rotation
+        A.Compose([
+            A.Resize(height=crop_size, width=crop_size),
+            A.Rotate(limit=5, p=1.0),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ]),
+        # Scale up slightly
+        A.Compose([
+            A.Resize(height=int(crop_size*1.1), width=int(crop_size*1.1)),
+            A.CenterCrop(height=crop_size, width=crop_size),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ]),
+        # Slight brightness adjustment
+        A.Compose([
+            A.Resize(height=crop_size, width=crop_size),
+            A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=1.0),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ]),
+    ]
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -149,9 +206,31 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+def mixup_data(x, y, alpha=0.2):
+    """Performs mixup augmentation on input data"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Loss function for mixup training"""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=15,
                 checkpoint_dir='checkpoints', resume_from=None, save_freq=1,
-                early_stop_patience=10, early_stop_min_delta=0.001):
+                early_stop_patience=10, early_stop_min_delta=0.001, use_mixup=True,
+                use_swa=True, swa_start=15, mixup_alpha=0.2):
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
@@ -174,7 +253,24 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 
     scaler = GradScaler()
 
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=1, eta_min=1e-6)
+    # Use OneCycleLR for better convergence
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=optimizer.param_groups[0]['lr'],
+        epochs=num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.1,
+        anneal_strategy='cos',
+        div_factor=25,
+        final_div_factor=1000
+    )
+
+    # Setup SWA for better generalization
+    swa_model = None
+    swa_scheduler = None
+    if use_swa:
+        swa_model = AveragedModel(model)
+        swa_scheduler = SWALR(optimizer, swa_lr=1e-5)
 
     for epoch in range(start_epoch, num_epochs):
         print(f'Epoch {epoch+1}/{num_epochs}:')
@@ -192,15 +288,34 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             optimizer.zero_grad()
 
             with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
-                outputs = model(inputs).squeeze()
-                loss = criterion(outputs, labels)
+                # Apply mixup augmentation
+                if use_mixup and epoch < num_epochs - 5:  # Disable mixup for last 5 epochs
+                    inputs_mixed, targets_a, targets_b, lam = mixup_data(inputs, labels, mixup_alpha)
+                    outputs = model(inputs_mixed).squeeze()
+                    loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+                    # For accuracy calculation, use original predictions
+                    with torch.no_grad():
+                        orig_outputs = model(inputs).squeeze()
+                        predicted = (torch.sigmoid(orig_outputs) > 0.5).float()
+                else:
+                    outputs = model(inputs).squeeze()
+                    loss = criterion(outputs, labels)
+                    predicted = (torch.sigmoid(outputs) > 0.5).float()
 
             scaler.scale(loss).backward()
+
+            # Gradient clipping for stability
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             scaler.step(optimizer)
             scaler.update()
 
+            # Step the scheduler
+            if epoch < swa_start or not use_swa:
+                scheduler.step()
+
             running_loss += loss.item() * inputs.size(0)
-            predicted = (torch.sigmoid(outputs) > 0.5).float()
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
@@ -240,7 +355,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         print(f'Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.4f}')
         print(f'Val Loss: {val_epoch_loss:.4f}, Val Acc: {val_epoch_acc:.4f}')
 
-        scheduler.step()
+        # Update SWA model after swa_start epochs
+        if use_swa and epoch >= swa_start:
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
 
         current_lr = optimizer.param_groups[0]['lr']
         print(f'Current Learning Rate: {current_lr:.6f}')
@@ -281,7 +399,22 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Loaded best model with validation accuracy: {checkpoint['best_val_acc']:.4f}")
 
-    return model, history
+    # Update batch normalization statistics for SWA model
+    if use_swa and swa_model is not None:
+        print("Updating SWA batch normalization statistics...")
+        torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
+
+        # Save SWA model
+        swa_model_path = os.path.join(checkpoint_dir, 'swa_model.pth')
+        torch.save({
+            'model_state_dict': swa_model.module.state_dict(),
+            'epoch': num_epochs,
+            'best_val_acc': best_val_acc,
+            'history': history
+        }, swa_model_path)
+        print(f"Saved SWA model to {swa_model_path}")
+
+    return model, history, swa_model
 
 def evaluate_model(model, test_loader):
     model.eval()
@@ -346,111 +479,3 @@ def predict_image(model, image_path, transform):
     prediction = "Pneumonia" if probability > 0.5 else "Normal"
 
     return prediction, probability
-
-def main():
-    set_seed(42)
-
-    data_dir = './chest_xray'  # Update this to your dataset path
-    train_dir = os.path.join(data_dir, 'train')
-    val_dir = os.path.join(data_dir, 'val')
-    test_dir = os.path.join(data_dir, 'test')
-
-    # Get transforms
-    train_transform, val_transform = get_transforms()
-
-    # Create datasets
-    train_dataset = ChestXRayDataset(train_dir, transform=train_transform)
-    val_dataset = ChestXRayDataset(val_dir, transform=val_transform)
-    test_dataset = ChestXRayDataset(test_dir, transform=val_transform)
-
-    # Get class counts and create weighted sampler to handle imbalance
-    class_counts = train_dataset.class_counts
-    print(f"Class distribution in training: {class_counts}")
-
-    # Calculate class weights if classes are imbalanced
-    weights = None
-    if abs(class_counts['normal'] - class_counts['pneumonia']) > 50:  # Check for imbalance
-        class_weights = {
-            0: 1.0 / class_counts['normal'],
-            1: 1.0 / class_counts['pneumonia']
-        }
-        sample_weights = [class_weights[label] for label in train_dataset.labels]
-        sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
-        train_shuffle = False  # Don't shuffle when using sampler
-    else:
-        sampler = None
-        train_shuffle = True
-
-    # Create data loaders with potential sampler
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=32,
-        shuffle=train_shuffle if sampler is None else False,
-        sampler=sampler,
-        num_workers=4
-    )
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
-
-    # Use a more powerful model
-    model = PneumoniaModel(use_pretrained=True, model_type='efficientnet_b4').to(device)
-
-    # Define loss function and optimizer
-    # Use BCEWithLogitsLoss instead of BCELoss
-    if weights is not None:
-        class_weights_tensor = torch.tensor([class_weights[0], class_weights[1]], device=device)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights_tensor[1])
-    else:
-        criterion = nn.BCEWithLogitsLoss()
-
-    # Use AdamW instead of Adam for better weight decay handling
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-
-    # Define checkpoint directory
-    checkpoint_dir = 'checkpoints'
-
-    # Increase training epochs and enable mixed precision
-    model, history = train_model(
-        model,
-        train_loader,
-        val_loader,
-        criterion,
-        optimizer,
-        num_epochs=25,  # Increase epochs
-        checkpoint_dir=checkpoint_dir,
-        resume_from=None,  # Change to a checkpoint path to resume training
-        save_freq=1
-    )
-
-    # Load best model
-    best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
-    if os.path.exists(best_model_path):
-        checkpoint = torch.load(best_model_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Loaded best model from {best_model_path} with validation accuracy: {checkpoint['best_val_acc']:.4f}")
-    else:
-        print(f"Warning: Best model file {best_model_path} not found. Using the last trained model.")
-
-    # Evaluate model
-    test_acc, all_preds, all_labels = evaluate_model(model, test_loader)
-
-    # Plot training history
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(history['train_loss'], label='Train')
-    plt.plot(history['val_loss'], label='Validation')
-    plt.title('Loss')
-    plt.legend()
-
-    plt.subplot(1, 2, 2)
-    plt.plot(history['train_acc'], label='Train')
-    plt.plot(history['val_acc'], label='Validation')
-    plt.title('Accuracy')
-    plt.legend()
-
-    plt.savefig('training_history.png')
-
-    print('Training and evaluation complete!')
-
-if __name__ == '__main__':
-    main()
