@@ -9,7 +9,7 @@ import os
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
-from sklearn.metrics import classification_report, roc_curve, auc
+from sklearn.metrics import classification_report, roc_curve, auc, f1_score, roc_auc_score
 from tqdm import tqdm
 import random
 from torch.optim.lr_scheduler import OneCycleLR
@@ -126,14 +126,19 @@ def get_transforms(image_size=256, crop_size=224):
         A.RandomCrop(height=crop_size, width=crop_size),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.1),
-        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=15, p=0.5),
+        A.Affine(
+            translate_percent=(-0.1, 0.1),
+            scale=(0.85, 1.15),
+            rotate=(-15, 15),
+            p=0.5
+        ),
         A.OneOf([
             A.GridDistortion(num_steps=5, distort_limit=0.3, p=1.0),
             A.ElasticTransform(alpha=1, sigma=50, p=1.0),
-            A.OpticalDistortion(distort_limit=0.3, shift_limit=0.3, p=1.0),
+            A.OpticalDistortion(distort_limit=0.3, p=1.0),
         ], p=0.3),
         A.OneOf([
-            A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+            A.GaussNoise(std_range=(0.12, 0.28), p=1.0),
             A.GaussianBlur(blur_limit=(3, 7), p=1.0),
             A.MotionBlur(blur_limit=7, p=1.0),
         ], p=0.2),
@@ -142,8 +147,12 @@ def get_transforms(image_size=256, crop_size=224):
             A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=1.0),
             A.RandomGamma(gamma_limit=(80, 120), p=1.0),
         ], p=0.5),
-        A.CoarseDropout(max_holes=8, max_height=crop_size//16, max_width=crop_size//16,
-                       min_holes=1, min_height=crop_size//32, min_width=crop_size//32, p=0.3),
+        A.CoarseDropout(
+            num_holes_range=(1, 8),
+            hole_height_range=(crop_size // 32, crop_size // 16),
+            hole_width_range=(crop_size // 32, crop_size // 16),
+            p=0.3
+        ),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
@@ -227,6 +236,37 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
+def find_optimal_threshold(y_true, y_prob, metric='f1'):
+    """Find an operating threshold using validation probabilities."""
+    thresholds = np.arange(0.1, 0.901, 0.01)
+    y_true = np.array(y_true).astype(int)
+    y_prob = np.array(y_prob)
+
+    best_threshold = 0.5
+    best_score = -1.0
+
+    for threshold in thresholds:
+        y_pred = (y_prob >= threshold).astype(int)
+        if metric == 'f1':
+            score = f1_score(y_true, y_pred, zero_division=0)
+        elif metric == 'balanced':
+            tp = np.sum((y_pred == 1) & (y_true == 1))
+            tn = np.sum((y_pred == 0) & (y_true == 0))
+            fp = np.sum((y_pred == 1) & (y_true == 0))
+            fn = np.sum((y_pred == 0) & (y_true == 1))
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            score = (recall + specificity) / 2
+        else:
+            score = f1_score(y_true, y_pred, zero_division=0)
+
+        if score > best_score:
+            best_score = score
+            best_threshold = float(threshold)
+
+    return best_threshold, best_score
+
+
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=15,
                 checkpoint_dir='checkpoints', resume_from=None, save_freq=1,
                 early_stop_patience=10, early_stop_min_delta=0.001, use_mixup=True,
@@ -235,15 +275,22 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         os.makedirs(checkpoint_dir)
 
     best_val_acc = 0.0
+    best_val_f1 = 0.0
+    best_val_auc = 0.0
     epochs_without_improve = 0
     start_epoch = 0
-    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    history = {
+        'train_loss': [], 'train_acc': [],
+        'val_loss': [], 'val_acc': [], 'val_f1': [], 'val_auc': []
+    }
 
     if resume_from and os.path.isfile(resume_from):
         print(f"Loading checkpoint '{resume_from}'")
         checkpoint = torch.load(resume_from)
         start_epoch = checkpoint['epoch']
-        best_val_acc = checkpoint['best_val_acc']
+        best_val_acc = checkpoint.get('best_val_acc', 0.0)
+        best_val_f1 = checkpoint.get('best_val_f1', best_val_acc)
+        best_val_auc = checkpoint.get('best_val_auc', 0.0)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         history = checkpoint['history']
@@ -330,6 +377,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         val_loss = 0.0
         val_correct = 0
         val_total = 0
+        val_probs = []
+        val_labels = []
 
         val_pbar = tqdm(val_loader, desc="Validation", leave=False)
 
@@ -341,19 +390,33 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 loss = criterion(outputs, labels)
 
                 val_loss += loss.item() * inputs.size(0)
-                predicted = (torch.sigmoid(outputs) > 0.5).float()
+                probs = torch.sigmoid(outputs)
+                predicted = (probs > 0.5).float()
                 val_total += labels.size(0)
                 val_correct += (predicted == labels).sum().item()
+                val_probs.extend(probs.detach().cpu().numpy())
+                val_labels.extend(labels.detach().cpu().numpy())
 
                 val_pbar.set_postfix(loss=loss.item(), acc=(predicted == labels).float().mean().item())
 
         val_epoch_loss = val_loss / len(val_loader.dataset)
         val_epoch_acc = val_correct / val_total
+        val_epoch_f1 = f1_score(np.array(val_labels).astype(int), (np.array(val_probs) >= 0.5).astype(int), zero_division=0)
+        try:
+            val_epoch_auc = roc_auc_score(np.array(val_labels).astype(int), np.array(val_probs))
+        except ValueError:
+            val_epoch_auc = 0.0
+
         history['val_loss'].append(val_epoch_loss)
         history['val_acc'].append(val_epoch_acc)
+        history['val_f1'].append(val_epoch_f1)
+        history['val_auc'].append(val_epoch_auc)
 
         print(f'Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.4f}')
-        print(f'Val Loss: {val_epoch_loss:.4f}, Val Acc: {val_epoch_acc:.4f}')
+        print(
+            f'Val Loss: {val_epoch_loss:.4f}, Val Acc: {val_epoch_acc:.4f}, '
+            f'Val F1: {val_epoch_f1:.4f}, Val AUC: {val_epoch_auc:.4f}'
+        )
 
         # Update SWA model after swa_start epochs
         if use_swa and epoch >= swa_start:
@@ -363,8 +426,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         current_lr = optimizer.param_groups[0]['lr']
         print(f'Current Learning Rate: {current_lr:.6f}')
 
-        if val_epoch_acc > best_val_acc + early_stop_min_delta:
+        if val_epoch_f1 > best_val_f1 + early_stop_min_delta:
             best_val_acc = val_epoch_acc
+            best_val_f1 = val_epoch_f1
+            best_val_auc = val_epoch_auc
             epochs_without_improve = 0
             best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
             torch.save({
@@ -372,9 +437,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_val_acc': best_val_acc,
+                'best_val_f1': best_val_f1,
+                'best_val_auc': best_val_auc,
                 'history': history
             }, best_model_path)
-            print(f"Saved best model to {best_model_path} with validation accuracy: {best_val_acc:.4f}")
+            print(
+                f"Saved best model to {best_model_path} with validation F1: {best_val_f1:.4f} "
+                f"(Acc: {best_val_acc:.4f}, AUC: {best_val_auc:.4f})"
+            )
         else:
             epochs_without_improve += 1
 
@@ -385,6 +455,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_val_acc': best_val_acc,
+                'best_val_f1': best_val_f1,
+                'best_val_auc': best_val_auc,
                 'history': history
             }, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
@@ -397,7 +469,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     if os.path.isfile(best_model_path):
         checkpoint = torch.load(best_model_path)
         model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Loaded best model with validation accuracy: {checkpoint['best_val_acc']:.4f}")
+        print(
+            "Loaded best model with validation metrics: "
+            f"Acc={checkpoint.get('best_val_acc', 0.0):.4f}, "
+            f"F1={checkpoint.get('best_val_f1', 0.0):.4f}, "
+            f"AUC={checkpoint.get('best_val_auc', 0.0):.4f}"
+        )
 
     # Update batch normalization statistics for SWA model
     if use_swa and swa_model is not None:
@@ -410,13 +487,15 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             'model_state_dict': swa_model.module.state_dict(),
             'epoch': num_epochs,
             'best_val_acc': best_val_acc,
+            'best_val_f1': best_val_f1,
+            'best_val_auc': best_val_auc,
             'history': history
         }, swa_model_path)
         print(f"Saved SWA model to {swa_model_path}")
 
     return model, history, swa_model
 
-def evaluate_model(model, test_loader):
+def evaluate_model(model, test_loader, threshold=0.5, save_roc_path='roc_curve.png', verbose=True):
     model.eval()
     all_preds = []
     all_labels = []
@@ -431,7 +510,7 @@ def evaluate_model(model, test_loader):
 
             outputs = model(inputs).squeeze()
             probs = torch.sigmoid(outputs)
-            predicted = (probs > 0.5).float()
+            predicted = (probs > threshold).float()
 
             test_total += labels.size(0)
             test_correct += (predicted == labels).sum().item()
@@ -443,29 +522,41 @@ def evaluate_model(model, test_loader):
             all_labels.extend(labels.cpu().numpy())
 
     test_acc = test_correct / test_total
-    print(f'Test Accuracy: {test_acc:.4f}')
+    if verbose:
+        print(f'Test Accuracy: {test_acc:.4f}')
 
     fpr, tpr, _ = roc_curve(all_labels, all_preds)
     roc_auc = auc(fpr, tpr)
 
-    binary_preds = [1 if p > 0.5 else 0 for p in all_preds]
+    binary_preds = [1 if p > threshold else 0 for p in all_preds]
+    test_f1 = f1_score(np.array(all_labels).astype(int), np.array(binary_preds).astype(int), zero_division=0)
     report = classification_report(all_labels, binary_preds, target_names=['Normal', 'Pneumonia'])
 
-    print(report)
-    print(f'AUC: {roc_auc:.4f}')
+    if verbose:
+        print(report)
+        print(f'AUC: {roc_auc:.4f}')
+        print(f'F1 (@{threshold:.2f}): {test_f1:.4f}')
 
-    plt.figure()
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Receiver Operating Characteristic')
-    plt.legend(loc="lower right")
-    plt.savefig('roc_curve.png')
+    if save_roc_path:
+        plt.figure()
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('Receiver Operating Characteristic')
+        plt.legend(loc="lower right")
+        plt.savefig(save_roc_path)
 
-    return test_acc, all_preds, all_labels
+    metrics = {
+        'accuracy': test_acc,
+        'auc': roc_auc,
+        'f1': test_f1,
+        'threshold': threshold
+    }
+
+    return test_acc, all_preds, all_labels, metrics
 
 def predict_image(model, image_path, transform):
     model.eval()

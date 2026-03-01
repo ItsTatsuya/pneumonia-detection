@@ -1,8 +1,10 @@
 import argparse
 import os
 import torch
+import json
 from model import (PneumoniaModel, ChestXRayDataset, get_transforms, train_model,
-                   evaluate_model, CombinedLoss, FocalLoss, LabelSmoothingBCEWithLogitsLoss)
+                   evaluate_model, CombinedLoss, FocalLoss, LabelSmoothingBCEWithLogitsLoss,
+                   find_optimal_threshold, set_seed)
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.nn as nn
 import torch.optim as optim
@@ -34,6 +36,9 @@ def parse_args():
     parser.add_argument('--swa_start', type=int, default=25, help='Epoch to start SWA')
     parser.add_argument('--image_size', type=int, default=256, help='Input image size before crop')
     parser.add_argument('--crop_size', type=int, default=224, help='Crop size for training')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--threshold_metric', type=str, default='f1', choices=['f1', 'balanced'],
+                        help='Metric used to select validation threshold')
     return parser.parse_args()
 
 def cleanup_old_checkpoints(checkpoint_dir, keep_n, exclude=None):
@@ -58,6 +63,8 @@ def cleanup_old_checkpoints(checkpoint_dir, keep_n, exclude=None):
 
 def main():
     args = parse_args()
+
+    set_seed(args.seed)
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -191,9 +198,48 @@ def main():
         print(f"SWA model saved to {os.path.join(args.output_dir, f'pneumonia_model_{timestamp}_swa.pth')}")
 
     print("Evaluating model on test set...")
-    test_acc, all_preds, all_labels = evaluate_model(model, test_loader)
 
-    print(f"Training complete! Final test accuracy: {test_acc:.4f}")
+    print("Selecting classification threshold on validation set (strict holdout protocol)...")
+    _, val_probs, val_labels, val_metrics = evaluate_model(
+        model,
+        val_loader,
+        threshold=0.5,
+        save_roc_path=os.path.join(args.output_dir, 'roc_curve_val.png'),
+        verbose=False
+    )
+
+    optimal_threshold, threshold_score = find_optimal_threshold(
+        val_labels,
+        val_probs,
+        metric=args.threshold_metric
+    )
+    print(
+        f"Validation-selected threshold ({args.threshold_metric}): "
+        f"{optimal_threshold:.3f} (score={threshold_score:.4f})"
+    )
+
+    threshold_artifact = {
+        'threshold': optimal_threshold,
+        'metric': args.threshold_metric,
+        'val_metrics_at_0_5': val_metrics
+    }
+    threshold_path = os.path.join(args.output_dir, f"threshold_{timestamp}.json")
+    with open(threshold_path, 'w') as f:
+        json.dump(threshold_artifact, f, indent=2)
+
+    test_acc, all_preds, all_labels, test_metrics = evaluate_model(
+        model,
+        test_loader,
+        threshold=optimal_threshold,
+        save_roc_path=os.path.join(args.output_dir, 'roc_curve_test.png'),
+        verbose=True
+    )
+
+    print(
+        "Training complete! "
+        f"Final test metrics -> Accuracy: {test_metrics['accuracy']:.4f}, "
+        f"F1: {test_metrics['f1']:.4f}, AUC: {test_metrics['auc']:.4f}"
+    )
 
     with open(os.path.join(args.output_dir, f"training_summary_{timestamp}.txt"), "w") as f:
         f.write(f"Model: ConvNeXt V2 Base\n")
@@ -208,9 +254,17 @@ def main():
         f.write(f"SWA start epoch: {args.swa_start}\n")
         f.write(f"Image size: {args.image_size}\n")
         f.write(f"Crop size: {args.crop_size}\n")
-        f.write(f"Final test accuracy: {test_acc:.4f}\n")
+        f.write(f"Seed: {args.seed}\n")
+        f.write(f"Threshold metric: {args.threshold_metric}\n")
+        f.write(f"Selected threshold (from val only): {optimal_threshold:.3f}\n")
+        f.write(f"Final test accuracy: {test_metrics['accuracy']:.4f}\n")
+        f.write(f"Final test F1: {test_metrics['f1']:.4f}\n")
+        f.write(f"Final test AUC: {test_metrics['auc']:.4f}\n")
+        f.write(f"Threshold artifact: {threshold_path}\n")
         if checkpoint:
-            f.write(f"Best validation accuracy: {checkpoint['best_val_acc']:.4f}\n")
+            f.write(f"Best validation accuracy: {checkpoint.get('best_val_acc', 0.0):.4f}\n")
+            f.write(f"Best validation F1: {checkpoint.get('best_val_f1', 0.0):.4f}\n")
+            f.write(f"Best validation AUC: {checkpoint.get('best_val_auc', 0.0):.4f}\n")
             f.write(f"Best model epoch: {checkpoint['epoch']}\n")
 
 if __name__ == "__main__":

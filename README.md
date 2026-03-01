@@ -1,139 +1,86 @@
 # Pneumonia Detection from Chest X-rays
 
-Deep learning model for detecting pneumonia in chest X-ray images. Uses ConvNeXt V2 with various training tricks to achieve ~95% accuracy.
+Binary chest X-ray classification (Normal vs Pneumonia) using ConvNeXt V2 with transfer learning, strong augmentation, mixed precision training, and validation-selected thresholding.
 
-## Results
+## Overview
 
-**Test Set Performance (624 images):**
+- **Task:** Binary classification on pediatric chest X-rays
+- **Backbone:** `convnextv2_base.fcmae_ft_in22k_in1k` (timm)
+- **Loss:** Combined focal + label-smoothed BCE
+- **Optimization:** AdamW + OneCycleLR + gradient clipping + optional SWA
+- **Evaluation protocol:** Threshold selected on validation only, then frozen for holdout test
 
-| Metric          | Score  |
-| --------------- | ------ |
-| Accuracy        | 94.87% |
-| ROC AUC         | 0.9787 |
-| Sensitivity     | 96.41% |
-| Specificity     | 92.31% |
-| False Positives | 18     |
-| False Negatives | 14     |
+Dataset: [Kaggle Chest X-Ray Pneumonia](https://www.kaggle.com/paultimothymooney/chest-xray-pneumonia)
 
-```
-              precision    recall  f1-score   support
+## Final Results (Holdout Test)
 
-      Normal       0.94      0.92      0.93       234
-   Pneumonia       0.95      0.96      0.96       390
-
-    accuracy                           0.95       624
-```
-
-## Requirements
-
-- Python 3.9+
-- CUDA GPU (training takes ~30 min on RTX 3080)
-- ~4GB VRAM minimum
-
-## Quick Start
+Run command:
 
 ```bash
-# Install deps
+python train.py --data_dir .\dataset --output_dir .\output --checkpoint_dir .\checkpoints
+```
+
+Test set size: **624** (Normal: 234, Pneumonia: 390)
+
+| Metric                           |      Value |
+| -------------------------------- | ---------: |
+| Accuracy                         | **0.9391** |
+| ROC-AUC                          | **0.9735** |
+| F1 (Pneumonia, threshold = 0.49) | **0.9525** |
+
+| Class     | Precision | Recall | F1-score | Support |
+| --------- | --------: | -----: | -------: | ------: |
+| Normal    |      0.96 |   0.88 |     0.92 |     234 |
+| Pneumonia |      0.93 |   0.98 |     0.95 |     390 |
+
+## Figures
+
+### Training Dynamics
+
+![Training Curves](output/training_curves.png)
+
+### Test ROC (Holdout)
+
+![Test ROC Curve](output/roc_curve_test.png)
+
+### Confusion Matrix
+
+![Confusion Matrix](predictions/confusion_matrix.png)
+
+### Sample Predictions
+
+**Normal (correct predictions)**
+
+![Normal Correct](predictions/normal_correct_predictions.png)
+
+**Normal (incorrect predictions)**
+
+![Normal Incorrect](predictions/normal_incorrect_predictions.png)
+
+**Pneumonia (correct predictions)**
+
+![Pneumonia Correct](predictions/pneumonia_correct_predictions.png)
+
+**Pneumonia (incorrect predictions)**
+
+![Pneumonia Incorrect](predictions/pneumonia_incorrect_predictions.png)
+
+## Reproducibility
+
+```bash
+# 1) Install dependencies
 pip install -r requirements.txt
 
-# Train
-python train.py --data_dir ./dataset --epochs 40
+# 2) Train + evaluate
+python train.py --data_dir .\dataset --output_dir .\output --checkpoint_dir .\checkpoints
 
-# Predict
-python predict.py --model_path output/pneumonia_model_TIMESTAMP.pth --data_dir dataset/test --use_tta
+# 3) Optional: standalone prediction report/visuals
+python predict.py --model_path output\pneumonia_model_<timestamp>_weights_only.pth --data_dir dataset\test --output_dir predictions --threshold_file output\threshold_<timestamp>.json --use_tta
 ```
 
-## Dataset Structure
+Primary artifacts:
 
-```
-dataset/
-├── train/
-│   ├── NORMAL/
-│   └── PNEUMONIA/
-├── val/
-│   ├── NORMAL/
-│   └── PNEUMONIA/
-└── test/
-    ├── NORMAL/
-    └── PNEUMONIA/
-```
-
-Get it from [Kaggle](https://www.kaggle.com/paultimothymooney/chest-xray-pneumonia).
-
-## Training
-
-```bash
-python train.py --data_dir /path/to/data --batch_size 16 --epochs 40
-```
-
-**Key arguments:**
-
-- `--loss_type`: `combined` (focal + label smoothing), `focal`, `smooth_bce`, `bce`
-- `--use_mixup` / `--no_mixup`: Mixup augmentation (on by default)
-- `--use_swa` / `--no_swa`: Stochastic Weight Averaging (on by default)
-- `--resume_from`: Resume from checkpoint
-
-**Resume training:**
-
-```bash
-python train.py --data_dir ./dataset --resume_from checkpoints/checkpoint_epoch_10.pth
-```
-
-## Prediction
-
-```bash
-python predict.py --model_path output/model.pth --data_dir dataset/test
-```
-
-**Key arguments:**
-
-- `--use_tta` / `--no_tta`: Test-time augmentation (averages 5 augmented predictions)
-- `--optimize_threshold`: Finds best classification threshold (not just 0.5)
-- `--threshold 0.7`: Use specific threshold
-
-## What's Under the Hood
-
-**Model:** ConvNeXt V2 Base pretrained on ImageNet-22k.
-
-**Loss:** Combined focal loss + label smoothing BCE. Focal loss helps with the class imbalance, label smoothing prevents overconfident predictions.
-
-**Augmentation:** Heavy augmentation via Albumentations - elastic transforms, grid distortion, coarse dropout, brightness/contrast jitter, etc. Also uses mixup during training.
-
-**Training tricks:**
-
-- Mixed precision (AMP) for faster training
-- OneCycleLR scheduler
-- Stochastic Weight Averaging in final epochs
-- Gradient clipping
-- AdamW with weight decay
-
-**Inference tricks:**
-
-- Test-time augmentation (5 augmented versions averaged)
-- Threshold optimization (finds optimal cutoff, not just 0.5)
-
-## Checkpoints
-
-Training saves:
-
-- `checkpoints/best_model.pth` - Best validation accuracy
-- `checkpoints/swa_model.pth` - SWA averaged weights
-- `checkpoints/checkpoint_epoch_N.pth` - Periodic saves
-
-Output saves:
-
-- `output/pneumonia_model_TIMESTAMP.pth` - Full checkpoint
-- `output/pneumonia_model_TIMESTAMP_weights_only.pth` - Just weights (smaller)
-- `output/pneumonia_model_TIMESTAMP_swa.pth` - SWA model
-
-## Prediction Output
-
-Running predict.py generates in `predictions/`:
-
-- `predictions.csv` - All predictions with probabilities
-- `summary.txt` - Accuracy metrics
-- `classification_report.txt` - Precision/recall/F1
-- `confusion_matrix.png`
-- `roc_curve.png`
-- `precision_recall_curve.png`
-- `threshold_analysis.png` - How metrics change with threshold
+- `checkpoints/best_model.pth`
+- `output/pneumonia_model_<timestamp>_weights_only.pth`
+- `output/threshold_<timestamp>.json`
+- `output/training_summary_<timestamp>.txt`

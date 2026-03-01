@@ -1,32 +1,32 @@
-Model: convnext_base
-Test dataset: dataset/test
+Model: ConvNeXt V2 Base
+Test dataset: .\dataset\test
 Total images: 624
 Normal images: 234
 Pneumonia images: 390
 Test-time augmentation: True
-Classification threshold: 0.710
+Classification threshold: 0.490
 
-Overall Accuracy: 94.87%
-Normal Class Accuracy: 92.31%
-Pneumonia Class Accuracy: 96.41%
-ROC AUC: 0.9787
+Overall Accuracy: 93.43%
+Normal Class Accuracy: 85.47%
+Pneumonia Class Accuracy: 98.21%
+ROC AUC: 0.9757
 
 Detailed Metrics:
-  Sensitivity (True Positive Rate): 96.41%
-  Specificity (True Negative Rate): 92.31%
-  Positive Predictive Value (Precision): 95.43%
-  Negative Predictive Value: 93.91%
-  True Positives: 376
-  True Negatives: 216
-  False Positives: 18
-  False Negatives: 14
+  Sensitivity (True Positive Rate): 98.21%
+  Specificity (True Negative Rate): 85.47%
+  Positive Predictive Value (Precision): 91.85%
+  Negative Predictive Value: 96.62%
+  True Positives: 383
+  True Negatives: 200
+  False Positives: 34
+  False Negatives: 7
 
 Classification Report:
               precision    recall  f1-score   support
 
-      Normal       0.94      0.92      0.93       234
-   Pneumonia       0.95      0.96      0.96       390
+      Normal       0.97      0.85      0.91       234
+   Pneumonia       0.92      0.98      0.95       390
 
-    accuracy                           0.95       624
-   macro avg       0.95      0.94      0.95       624
-weighted avg       0.95      0.95      0.95       624
+    accuracy                           0.93       624
+   macro avg       0.94      0.92      0.93       624
+weighted avg       0.94      0.93      0.93       624
