@@ -53,17 +53,9 @@ Test set size: **624** (Normal: 234, Pneumonia: 390)
 
 ![Normal Correct](predictions/normal_correct_predictions.png)
 
-**Normal (incorrect predictions)**
-
-![Normal Incorrect](predictions/normal_incorrect_predictions.png)
-
 **Pneumonia (correct predictions)**
 
 ![Pneumonia Correct](predictions/pneumonia_correct_predictions.png)
-
-**Pneumonia (incorrect predictions)**
-
-![Pneumonia Incorrect](predictions/pneumonia_incorrect_predictions.png)
 
 ## Reproducibility
 
